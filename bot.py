@@ -209,25 +209,42 @@ def sp_token():
     return r.json()["access_token"]
 
 
+VARIANT_WORDS = ("lofi", "lo fi", "lo-fi", "flip", "remix", "slowed", "reverb", "sped up",
+                 "cover", "karaoke", "instrumental", "mashup", "8d", "unplugged")
+
+
+def score(it, title, artist):
+    """Higher is better: title match + artist match, minus lofi/remix versions not asked for."""
+    name = it["name"].lower()
+    s = SequenceMatcher(None, clean(title), clean(it["name"])).ratio()
+    artist_words = clean(artist).split()
+    if artist_words:
+        artists = " ".join(a["name"].lower() for a in it.get("artists", []))
+        if artist_words[0] in artists:
+            s += 0.5
+    asked = (title + " " + artist).lower()
+    if any(w in name and w not in asked for w in VARIANT_WORDS):
+        s -= 0.6
+    return s
+
+
 def sp_search(tok, title, artist):
     h = {"Authorization": f"Bearer {tok}"}
-    attempts = []
+    queries = []
     if artist:
-        attempts.append((f'track:"{title}" artist:"{artist}"', True))
-    attempts.append((f"{title} {artist}".strip(), False))
-    for q, filtered in attempts:
+        queries.append(f'track:"{title}" artist:"{artist}"')
+    queries.append(f"{title} {artist}".strip())
+    candidates = []
+    for q in queries:
         r = requests.get("https://api.spotify.com/v1/search",
-                         params={"q": q, "type": "track", "limit": 5}, headers=h, timeout=30)
-        if r.status_code != 200:
-            continue
-        items = (r.json().get("tracks") or {}).get("items") or []
-        if not items:
-            continue
-        if filtered:
-            return items[0]
-        best = max(items, key=lambda it: SequenceMatcher(None, clean(title), clean(it["name"])).ratio())
-        if SequenceMatcher(None, clean(title), clean(best["name"])).ratio() >= 0.5:
-            return best
+                         params={"q": q, "type": "track", "limit": 10}, headers=h, timeout=30)
+        if r.status_code == 200:
+            candidates += (r.json().get("tracks") or {}).get("items") or []
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda it: score(it, title, artist))
+    if SequenceMatcher(None, clean(title), clean(best["name"])).ratio() >= 0.5:
+        return best
     return None
 
 
@@ -324,7 +341,9 @@ def process(msg):
         for line in text.splitlines():
             line = line.strip(" -•\t")
             if line:
-                title, _, artist = line.partition(" - ")
+                parts = re.split(r"\s+[-–—]\s*|\s*[-–—]\s+", line, maxsplit=1)
+                title = parts[0]
+                artist = parts[1] if len(parts) > 1 else ""
                 songs.append({"title": title.strip(), "artist": artist.strip(), "source": "typed"})
         send(chat_id, report(dedupe(songs)) if songs else HELP)
         return
