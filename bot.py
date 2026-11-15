@@ -142,7 +142,38 @@ GEMINI_PROMPT = """You are given an Instagram reel (video with audio).CAPTION_PA
 List every song in it: songs the creator recommends or names (spoken aloud, shown as on-screen text, or written in the caption), plus any recognisable song that plays.
 Return JSON only, in this form:
 {"songs": [{"title": "...", "artist": "...", "how": "spoken | on-screen | caption | playing"}]}
-Use each song's official title and main artist. Skip anything you are not sure is a real song. If there are none, return {"songs": []}."""
+Use each song's official ORIGINAL title and original artist, never a remix, lofi, slowed or mashup version. Skip anything you are not sure is a real song. If there are none, return {"songs": []}."""
+
+
+def gemini_models(client):
+    """Models to try, best first: GEMINI_MODEL if set, then the newest 'flash' models available."""
+    picks = [GEMINI_MODEL] if env("GEMINI_MODEL") else []
+    found = []
+    try:
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            low = name.lower()
+            if not low.startswith("gemini") or "flash" not in low:
+                continue
+            if any(x in low for x in ("image", "tts", "live", "audio", "embedding", "thinking")):
+                continue
+            v = re.search(r"gemini-(\d+(?:\.\d+)?)", low)
+            version = float(v.group(1)) if v else 0.0
+            # Prefer newer versions, then stable over preview/exp, then full flash over lite
+            found.append(((version, "preview" not in low and "exp" not in low, "lite" not in low), name))
+    except Exception:
+        pass
+    picks += [n for _, n in sorted(found, reverse=True)]
+    picks += ["gemini-flash-latest", "gemini-2.5-flash"]
+    seen, out = set(), []
+    for p in picks:
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out[:6]
 
 
 def gemini_songs(video, caption):
@@ -161,11 +192,19 @@ def gemini_songs(video, caption):
         time.sleep(3)
     caption_part = f'\nCaption: """{caption[:3000]}"""' if caption else ""
     prompt = GEMINI_PROMPT.replace("CAPTION_PART", caption_part)
-    resp = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[f, prompt],
-        config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
-    )
+    config = types.GenerateContentConfig(response_mime_type="application/json", temperature=0)
+    resp, last_err = None, None
+    for model in gemini_models(client):
+        try:
+            resp = client.models.generate_content(model=model, contents=[f, prompt], config=config)
+            break
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            if not any(x in msg for x in ("404", "NOT_FOUND", "no longer available", "not supported")):
+                break
+    if resp is None:
+        raise last_err or RuntimeError("no Gemini model available")
     try:
         client.files.delete(name=f.name)
     except Exception:
@@ -188,7 +227,7 @@ def clean(s):
 def dedupe(songs):
     seen, out = set(), []
     for s in songs:
-        key = clean(s["title"])
+        key = clean(plain_title(s["title"]))
         if key and key not in seen:
             seen.add(key)
             out.append(s)
@@ -210,30 +249,52 @@ def sp_token():
 
 
 VARIANT_WORDS = ("lofi", "lo fi", "lo-fi", "flip", "remix", "slowed", "reverb", "sped up",
-                 "cover", "karaoke", "instrumental", "mashup", "8d", "unplugged")
+                 "speed up", "cover", "karaoke", "instrumental", "mashup", " 8d", "unplugged",
+                 " mix", "bass boosted", "nightcore", "rework", " edit", "dj ", "version")
+_VARIANT_RE = "|".join(re.escape(w.strip()) for w in VARIANT_WORDS)
+
+
+def is_variant(name):
+    low = " " + (name or "").lower() + " "
+    return any(w in low for w in VARIANT_WORDS)
+
+
+def plain_title(title):
+    """'Kesariya (Lofi Flip)' / 'Kesariya - Slowed + Reverb' / 'Kesariya [Remix]' -> 'Kesariya'."""
+    t = title or ""
+    # Drop (...) or [...] parts that mention a remix/lofi/etc.
+    t = re.sub(r"[\(\[][^\)\]]*(?:%s)[^\)\]]*[\)\]]" % _VARIANT_RE, " ", t, flags=re.I)
+    # Drop ' - Lofi Flip' / ' | Slowed Reverb' style endings
+    t = re.sub(r"\s[-–—|:]\s.*(?:%s).*$" % _VARIANT_RE, " ", t, flags=re.I)
+    # Drop leftover variant words
+    t = re.sub(r"\b(?:lofi|lo-fi|slowed|reverb|remix|mashup|sped up)\b", " ", t, flags=re.I)
+    t = " ".join(t.replace("+", " ").split()).strip(" -–|:")
+    return t or (title or "").strip()
 
 
 def score(it, title, artist):
-    """Higher is better: title match + artist match, minus lofi/remix versions not asked for."""
-    name = it["name"].lower()
+    """Higher is better: title match + artist match; remix/lofi/slowed versions heavily penalised."""
     s = SequenceMatcher(None, clean(title), clean(it["name"])).ratio()
     artist_words = clean(artist).split()
     if artist_words:
         artists = " ".join(a["name"].lower() for a in it.get("artists", []))
         if artist_words[0] in artists:
             s += 0.5
-    asked = (title + " " + artist).lower()
-    if any(w in name and w not in asked for w in VARIANT_WORDS):
-        s -= 0.6
+    if is_variant(it["name"]):
+        s -= 1.0
     return s
 
 
 def sp_search(tok, title, artist):
     h = {"Authorization": f"Bearer {tok}"}
+    title = plain_title(title)
     queries = []
     if artist:
         queries.append(f'track:"{title}" artist:"{artist}"')
     queries.append(f"{title} {artist}".strip())
+    if artist:
+        # Remixes often credit the remixer as artist, so also search the title alone
+        queries.append(title)
     candidates = []
     for q in queries:
         r = requests.get("https://api.spotify.com/v1/search",
